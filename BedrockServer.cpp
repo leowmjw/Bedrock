@@ -21,6 +21,8 @@ void BedrockServer::acceptCommand(SQLiteCommand&& command) {
         _crashCommands.insert(make_pair(request.methodLine, request.nameValueMap));
         SALERT("Blacklisting command (now have " << _crashCommands.size() << " blacklisted commands): " << request.serialize());
     } else {
+        SINFO("Queued new '" << command.request.methodLine << "' command from bedrock node, with " << _commandQueue.size()
+              << " commands already queued.");
         _commandQueue.push(BedrockCommand(move(command)));
     }
 }
@@ -829,6 +831,11 @@ bool BedrockServer::_wouldCrash(const BedrockCommand& command) {
         // These are all of the keys that need to match to kill this command.
         bool isMatch = true;
         for (auto& pair : values) {
+            // We skip Content-Length, as it's added automatically when serializing commands.
+            if (SIEquals(pair.first, "Content-Length")) {
+                continue;
+            }
+
             // See if our current command even has the blacklisted key.
             auto it = command.request.nameValueMap.find(pair.first);
             if (it ==  command.request.nameValueMap.end()) {
@@ -1130,10 +1137,17 @@ void BedrockServer::postPoll(fd_map& fdm, uint64_t& nextActivity) {
         }
     }
 
+    // Timing variables.
+    int deserializationAttempts = 0;
+    int deserializedRequests = 0;
+    int acceptedSockets = 0;
+    uint64_t startTime = STimeNow();
+
     // Accept any new connections
     Socket* s = nullptr;
     Port* acceptPort = nullptr;
     while ((s = acceptSocket(acceptPort))) {
+        acceptedSockets++;
         // Accepted a new socket
         // NOTE: BedrockServer doesn't need to keep a new list; there's already STCPManager::socketList.
         // Look up the plugin that owns this port (if any).
@@ -1149,9 +1163,13 @@ void BedrockServer::postPoll(fd_map& fdm, uint64_t& nextActivity) {
         }
     }
 
+    // Time the end of the accept section.
+    uint64_t acceptEndTime = STimeNow();
+
     // Process any new activity from incoming sockets. In order to not modify the socket list while we're iterating
     // over it, we'll keep a list of sockets that need closing.
     list<STCPManager::Socket*> socketsToClose;
+
     for (auto s : socketList) {
         switch (s->state.load()) {
             case STCPManager::Socket::CLOSED:
@@ -1197,11 +1215,13 @@ void BedrockServer::postPoll(fd_map& fdm, uint64_t& nextActivity) {
                     // Otherwise, handle any default request.
                     int requestSize = request.deserialize(s->recvBuffer);
                     SConsumeFront(s->recvBuffer, requestSize);
+                    deserializationAttempts++;
                 }
 
                 // If we have a populated request, from either a plugin or our default handling, we'll queue up the
                 // command.
                 if (!request.empty()) {
+                    deserializedRequests++;
                     // Either shut down the socket or store it so we can eventually sync out the response.
                     if (SIEquals(request["Connection"], "forget") ||
                         (uint64_t)request.calc64("commandExecuteTime") > STimeNow()) {
@@ -1265,6 +1285,8 @@ void BedrockServer::postPoll(fd_map& fdm, uint64_t& nextActivity) {
                         }
                     } else if (_shutdownState < PORTS_CLOSED) {
                         // Otherwise we queue it for later processing.
+                        SINFO("Queued new '" << command.request.methodLine << "' command from local client, with "
+                              << _commandQueue.size() << " commands already queued.");
                         _commandQueue.push(move(command));
                     }
                 }
@@ -1283,6 +1305,13 @@ void BedrockServer::postPoll(fd_map& fdm, uint64_t& nextActivity) {
             break;
         }
     }
+
+    // Log the timing of this loop.
+    uint64_t acceptElapsedMS = (acceptEndTime - startTime) / 1000;
+    uint64_t readElapsedMS = (STimeNow() - acceptEndTime) / 1000;
+    SINFO("Accepted " << acceptedSockets << " new sockets in " << acceptElapsedMS << "ms. Read from " << socketList.size()
+          << " sockets, attempted to deserialize " << deserializationAttempts << " commands, " << deserializedRequests
+          << " were complete and deserialized in " << readElapsedMS << "ms.");
 
     // Now we can close any sockets that we need to.
     for (auto s: socketsToClose) {
@@ -1636,4 +1665,19 @@ SData BedrockServer::_generateCrashMessage(const BedrockCommand* command) {
     }
     message.content = subMessage.serialize();
     return message;
+}
+
+void BedrockServer::onNodeLogin(SQLiteNode::Peer* peer)
+{
+    shared_lock<decltype(_crashCommandMutex)> lock(_crashCommandMutex);
+    for (const auto& p : _crashCommands) {
+        SALERT("Sending crash command " << p.first << " to node " << peer->name << " on login");
+        SData command(p.first);
+        command.nameValueMap = p.second;
+        BedrockCommand cmd(command);
+        for (const auto& fields : command.nameValueMap) {
+            cmd.crashIdentifyingValues.insert(fields.first);
+        }
+        _syncNode->emergencyBroadcast(_generateCrashMessage(&cmd), peer);
+    }
 }

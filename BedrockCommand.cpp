@@ -174,7 +174,7 @@ void BedrockCommand::finalizeTimingInfo() {
 
     // Time that wasn't accounted for in all the other metrics.
     uint64_t unaccountedTime = totalTime - (peekTotal + processTotal + commitWorkerTotal + commitSyncTotal +
-                                            queueWorkerTotal + queueSyncTotal);
+                                            escalationTimeUS + queueWorkerTotal + queueSyncTotal);
 
     // Build a map of the values we care about.
     map<string, uint64_t> valuePairs = {
@@ -226,7 +226,8 @@ void BedrockCommand::finalizeTimingInfo() {
           << queueWorkerTotal << ", "
           << queueSyncTotal << ", "
           << totalTime << ", "
-          << unaccountedTime << ". Upstream: "
+          << unaccountedTime << ", "
+          << escalationTimeUS << ". Upstream: "
           << upstreamPeekTime << ", "
           << upstreamProcessTime << ", "
           << upstreamTotalTime << ", "
@@ -255,10 +256,11 @@ BedrockCommand SSynchronizedQueue<BedrockCommand>::pop() {
 }
 
 template<>
-void SSynchronizedQueue<BedrockCommand>::push(BedrockCommand&& rhs) {
+void SSynchronizedQueue<BedrockCommand>::push(BedrockCommand&& cmd) {
     SAUTOLOCK(_queueMutex);
+    SINFO("Enqueuing command '" << cmd.request.methodLine << "', with " << _queue.size() << " commands already queued.");
     // Just add to the queue
-    _queue.push_back(move(rhs));
+    _queue.push_back(move(cmd));
     _queue.back().startTiming(BedrockCommand::QUEUE_SYNC);
 
     // Write arbitrary buffer to the pipe so any subscribers will be awoken.
